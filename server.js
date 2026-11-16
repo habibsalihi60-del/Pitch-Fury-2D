@@ -1,78 +1,175 @@
-// Pitch Fury matchmaking server. No dependencies. Run: node server.js  (PORT env, default 8080)
-// Client: open the game with ?server=ws://localhost:8080, or set ONLINE_SERVER in the HTML.
-const http = require('http'), crypto = require('crypto'), fs = require('fs');
-const PORT = +process.env.PORT || 8080, DB = process.env.DB || './ratings.json';
-let R = {}; try { R = JSON.parse(fs.readFileSync(DB, 'utf8')); } catch (e) { }
-let dirty = 0; setInterval(() => { if (dirty) { dirty = 0; try { fs.writeFileSync(DB, JSON.stringify(R)); } catch (e) { } } }, 5000);
-const rec = uid => R[uid] || (R[uid] = { n: 'Player', mmr: 1000, g: 0, w: 0, d: 0, l: 0, vs: {} });
-const rank = uid => 1 + Object.values(R).filter(r => r.g && r.mmr > R[uid].mmr).length;
-const me = uid => { const r = rec(uid); return { t: 'me', mmr: r.mmr, g: r.g, w: r.w, d: r.d, l: r.l, rank: r.g ? rank(uid) : 0 }; };
+/* Pitch Fury online server: ranked matchmaking (Elo MMR), private rooms, leaderboard, validated relay.
+   The HOST client runs the match; this server pairs players, enforces roles, sanitises squads, rate-limits,
+   and settles ranked results. Run: npm install && npm start (PORT env, default 8080). */
+const http = require('http');
+const fs = require('fs');
+const { WebSocketServer } = require('ws');
 
-/* minimal RFC 6455 websocket (text frames only) */
-function frame(s) { const b = Buffer.from(s), n = b.length; let h; if (n < 126) h = Buffer.from([0x81, n]); else if (n < 65536) { h = Buffer.alloc(4); h[0] = 0x81; h[1] = 126; h.writeUInt16BE(n, 2); } else { h = Buffer.alloc(10); h[0] = 0x81; h[1] = 127; h.writeBigUInt64BE(BigInt(n), 2); } return Buffer.concat([h, b]); }
-const server = http.createServer((q, s) => { s.writeHead(200); s.end('Pitch Fury server'); });
-const queue = [], rooms = {};
-function send(c, o) { if (c && !c.dead) try { c.sock.write(frame(JSON.stringify(o))); } catch (e) { } }
-function pair(a, b, ranked) {
-    a.opp = b; b.opp = a; a.q = b.q = 0; a.over = b.over = 0; a.ranked = b.ranked = ranked; a.role = 'host'; b.role = 'guest';
-    send(a, { t: 'matched', role: 'host', opp: b.name, ranked, oppMmr: rec(b.uid).mmr });
-    send(b, { t: 'matched', role: 'guest', opp: a.name, ranked, oppMmr: rec(a.uid).mmr });
-}
-function leave(c) {
-    const i = queue.indexOf(c); if (i >= 0) queue.splice(i, 1); c.q = 0;
-    if (c.code && rooms[c.code] === c) delete rooms[c.code]; c.code = '';
-    if (c.opp) { const o = c.opp; c.opp = null; if (o.opp === c) { o.opp = null; send(o, { t: 'left' }); } }
-}
-function rate(host, guest, sc, pw) {
-    if (host.over) return; host.over = guest.over = 1; if (!host.ranked) return;
-    const [a, b] = sc, ra = rec(host.uid), rb = rec(guest.uid);
-    const sa = a > b ? 1 : a < b ? 0 : pw === 0 ? 1 : pw === 1 ? 0 : .5;
-    const ea = 1 / (1 + Math.pow(10, (rb.mmr - ra.mmr) / 400)), K = 24;
-    const key = [host.uid, guest.uid].sort().join('|'), day = Math.floor(Date.now() / 864e5);
-    ra.vs[guest.uid] = (ra.vs[guest.uid] && ra.vs[guest.uid][0] === day ? ra.vs[guest.uid] : [day, 0]); const cnt = ++ra.vs[guest.uid][1];
-    const capped = cnt > 5 || a + b > 40; let da = 0, db = 0;
-    if (!capped) { da = Math.round(K * (sa - ea)); db = -da; ra.mmr = Math.max(0, ra.mmr + da); rb.mmr = Math.max(0, rb.mmr + db); }
-    ra.g++; rb.g++; if (sa === 1) { ra.w++; rb.l++; } else if (sa === 0) { ra.l++; rb.w++; } else { ra.d++; rb.d++; }
-    dirty = 1;
-    [[host, ra, da], [guest, rb, db]].forEach(([c, r, d]) => send(c, { t: 'rated', mmr: r.mmr, g: r.g, w: r.w, d: r.d, l: r.l, rank: rank(c.uid), delta: d, capped }));
-}
-function onMsg(c, m) {
-    if (m.t === 'auth') { c.uid = String(m.uid || '').slice(0, 64); if (c.uid.length < 8) return c.sock.destroy(); c.name = String(m.name || 'Player').slice(0, 16) || 'Player'; rec(c.uid).n = c.name; return send(c, me(c.uid)); }
-    if (!c.uid) return;
-    if (m.t === 'find') { leave(c); c.name = String(m.name || c.name).slice(0, 16) || 'Player'; rec(c.uid).n = c.name; c.q = Date.now(); queue.push(c); send(c, { t: 'queued' }); }
-    else if (m.t === 'cancel') leave(c);
-    else if (m.t === 'create') { leave(c); let k; do { k = Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ'[Math.random() * 24 | 0]).join(''); } while (rooms[k]); rooms[k] = c; c.code = k; send(c, { t: 'room', code: k }); }
-    else if (m.t === 'join') { const h = rooms[String(m.code || '').toUpperCase()]; if (!h || h === c || h.opp) return send(c, { t: 'err', m: 'Room not found.' }); leave(c); delete rooms[h.code]; h.code = ''; c.name = String(m.name || c.name).slice(0, 16) || 'Player'; pair(h, c, 0); }
-    else if (m.t === 'lb') { const top = Object.values(R).filter(r => r.g).sort((a, b) => b.mmr - a.mmr).slice(0, 20).map(r => ({ n: r.n, mmr: r.mmr })); send(c, { t: 'lb', top, me: me(c.uid) }); }
-    else if (m.t === 'r' && c.opp && m.d) {
-        if (m.d.k === 'over' && c.role === 'host' && Array.isArray(m.d.sc)) rate(c, c.opp, m.d.sc.map(x => Math.max(0, +x | 0)), m.d.pw);
-        send(c.opp, m);
-    }
-}
-/* matchmaking tick: closest MMR first, range widens with wait time */
-setInterval(() => {
-    const now = Date.now();
-    for (const c of queue) { c.range = 75 + Math.floor((now - c.q) / 2000) * 50; send(c, { t: 'q', range: c.range }); }
-    for (let i = 0; i < queue.length; i++) for (let j = i + 1; j < queue.length; j++) {
-        const a = queue[i], b = queue[j];
-        if (Math.abs(rec(a.uid).mmr - rec(b.uid).mmr) <= Math.max(a.range, b.range) && a.uid !== b.uid) { queue.splice(j, 1); queue.splice(i, 1); pair(a, b, 1); i--; break; }
-    }
-}, 1000);
-server.on('upgrade', (req, sock) => {
-    const key = req.headers['sec-websocket-key']; if (!key) return sock.destroy();
-    sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64') + '\r\n\r\n');
-    const c = { sock, uid: '', name: 'Player', q: 0, opp: null, code: '', dead: 0 }; let buf = Buffer.alloc(0);
-    sock.on('data', d => {
-        buf = Buffer.concat([buf, d]);
-        for (; ;) {
-            if (buf.length < 2) return; const op = buf[0] & 15; let n = buf[1] & 127, o = 2;
-            if (n === 126) { if (buf.length < 4) return; n = buf.readUInt16BE(2); o = 4; } else if (n === 127) { if (buf.length < 10) return; n = Number(buf.readBigUInt64BE(2)); o = 10; }
-            if (n > 1 << 20) return sock.destroy(); if (buf.length < o + 4 + n) return;
-            const mk = buf.slice(o, o + 4), p = Buffer.from(buf.slice(o + 4, o + 4 + n)); for (let i = 0; i < n; i++) p[i] ^= mk[i & 3]; buf = buf.slice(o + 4 + n);
-            if (op === 8) return sock.end(); if (op === 9) { sock.write(Buffer.concat([Buffer.from([0x8a, p.length]), p])); continue; }
-            if (op === 1) { try { onMsg(c, JSON.parse(p.toString())); } catch (e) { } }
-        }
-    });
-    const bye = () => { if (c.dead) return; c.dead = 1; leave(c); }; sock.on('close', bye); sock.on('error', bye);
+const PORT = process.env.PORT || 8080;
+const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean); // empty = allow all
+const DATA_FILE = process.env.DATA_FILE || './players.json';      // on hosts with ephemeral disks, use a mounted volume or a DB
+const MIN_MATCH_SEC = +(process.env.MIN_MATCH_SEC || 60);        // results of shorter matches never change ratings
+const MAX_MSG_PER_SEC = 200;
+const START_MMR = 1000, WIN_BASE = 60, WIN_GROW = 30;            // search window = 60 + 30 per second waiting
+const PAIR_LIMIT = 3;                                            // rated games between the same two players per hour
+
+/* ---------- persistence ---------- */
+let DB = {}; try { DB = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) { }
+let dirty = false;
+setInterval(() => { if (!dirty) return; dirty = false; fs.writeFile(DATA_FILE, JSON.stringify(DB), () => { }); }, 10000);
+const player = uid => DB[uid] || (DB[uid] = { name: '', mmr: START_MMR, g: 0, w: 0, l: 0, d: 0 });
+const pub = p => ({ mmr: p.mmr, g: p.g, w: p.w, l: p.l, d: p.d });
+const rankOf = p => 1 + Object.values(DB).filter(q => q.g > 0 && q.mmr > p.mmr).length;
+
+/* ---------- http / ws ---------- */
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end('ok'); }
+  res.writeHead(404); res.end();
 });
-server.listen(PORT, () => console.log('Pitch Fury server on :' + PORT));
+/* no per-message compression: snapshots are already deltas, and deflate adds latency and CPU on small hosts */
+const wss = new WebSocketServer({ server, maxPayload: 64 * 1024, perMessageDeflate: false });
+
+let nextId = 1;
+const queue = [];
+const rooms = new Map();
+const recent = new Map();      // "uidA|uidB" -> [timestamps of rated games]
+const ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+const code4 = () => { for (let n = 0; n < 50; n++) { let c = ''; for (let i = 0; i < 4; i++) c += ALPHA[Math.random() * ALPHA.length | 0]; if (!rooms.has(c)) return c; } return null; };
+
+const clean = (v, n) => String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f<>]/g, '').slice(0, n);
+const num = (v, lo, hi, d) => { v = +v; return Number.isFinite(v) ? Math.max(lo, Math.min(hi, Math.round(v))) : d; };
+const color = v => /^#[0-9a-fA-F]{3,8}$/.test(String(v)) ? String(v) : '#888888';
+const POS = new Set(['G', 'D', 'M', 'A', 'LB', 'RB', 'CB', 'LM', 'RM', 'CM', 'ST', 'W']);
+
+function sanitizeInfo(i) {
+  if (!i || !Array.isArray(i.pl) || i.pl.length !== 6 || !Array.isArray(i.tn)) return null;
+  const pl = i.pl.map(p => p && ({
+    name: clean(p.name, 26), pos: POS.has(String(p.pos)) ? String(p.pos) : clean(p.pos, 3),
+    ovr: num(p.ovr, 1, 130, 50), pac: num(p.pac, 1, 130, 50), sho: num(p.sho, 1, 130, 50),
+    pas: num(p.pas, 1, 130, 50), def: num(p.def, 1, 130, 50), dri: num(p.dri, 1, 130, 50), xp: 0,
+  }));
+  if (pl.some(p => !p || !p.name)) return null;
+  return { tn: [clean(i.tn[0], 24), color(i.tn[1]), color(i.tn[2])], pl };
+}
+const send = (c, o) => { if (c && c.ws.readyState === 1) c.ws.send(JSON.stringify(o)); };
+
+/* ---------- ratings (Elo, bigger steps while a player is new) ---------- */
+const kFor = p => p.g < 10 ? 40 : p.g < 30 ? 28 : 20;
+function elo(p, oppMmr, S, gd, capped) {
+  if (capped) return 0;
+  const E = 1 / (1 + Math.pow(10, (oppMmr - p.mmr) / 400));
+  const mult = S === 1 ? 1 + 0.1 * Math.min(Math.max(gd - 1, 0), 3) : 1;
+  return Math.round(kFor(p) * (S - E) * mult);
+}
+/* sa = result for side a: 1 win, .5 draw, 0 loss */
+function settle(match, sa, gd) {
+  if (match.done) return; match.done = true; match.live = false;
+  const A = match.a, B = match.b; if (!A.p || !B.p) return;
+  const key = [A.uid, B.uid].sort().join('|'), now = Date.now();
+  const hist = (recent.get(key) || []).filter(t => now - t < 3600e3), capped = hist.length >= PAIR_LIMIT;
+  if (!capped) { hist.push(now); } recent.set(key, hist);
+  const am = A.p.mmr, bm = B.p.mmr;
+  const da = elo(A.p, bm, sa, gd, capped), db = elo(B.p, am, 1 - sa, gd, capped);
+  for (const [c, d, s] of [[A, da, sa], [B, db, 1 - sa]]) {
+    c.p.mmr = Math.max(100, c.p.mmr + d); c.p.g++; if (s === 1) c.p.w++; else if (s === 0) c.p.l++; else c.p.d++;
+    send(c, { t: 'rated', delta: d, capped, ...pub(c.p), rank: rankOf(c.p) });
+  }
+  dirty = true;
+}
+/* host reports the final score: a = host */
+function settleScore(match, sc, pw) {
+  const a = num(sc && sc[0], 0, 99, 0), b = num(sc && sc[1], 0, 99, 0);
+  if (Date.now() - match.t0 < MIN_MATCH_SEC * 1000) { match.done = true; match.live = false; send(match.a, { t: 'rated', delta: 0, capped: true, ...pub(match.a.p), rank: rankOf(match.a.p) }); send(match.b, { t: 'rated', delta: 0, capped: true, ...pub(match.b.p), rank: rankOf(match.b.p) }); return; }
+  const hostSide = match.a.role === 'host' ? match.a : match.b;
+  let s = a > b ? 1 : a < b ? 0 : (pw === 0 ? 1 : pw === 1 ? 0 : .5);   // from the host's side
+  settle(match, hostSide === match.a ? s : 1 - s, Math.abs(a - b));
+}
+
+/* ---------- pairing ---------- */
+function unlink(c, notify) {
+  const p = c.partner; c.partner = null; c.match = null;
+  if (p) { p.partner = null; p.match = null; if (notify) send(p, { t: 'left' }); }
+}
+function leaveAll(c, notify) {
+  const qi = queue.indexOf(c); if (qi >= 0) queue.splice(qi, 1);
+  if (c.room) { if (rooms.get(c.room) === c) rooms.delete(c.room); c.room = null; }
+  const m = c.match;   // leaving a live ranked match = a loss
+  if (m && m.ranked && m.live && !m.done) settle(m, m.a === c ? 0 : 1, 1);
+  unlink(c, notify);
+}
+function pair(host, guest, ranked) {
+  leaveAll(host, false); leaveAll(guest, false);
+  const match = { a: host, b: guest, ranked, live: false, done: false, roles: 0, t0: Date.now() };
+  host.match = guest.match = match; host.partner = guest; guest.partner = host; host.role = 'host'; guest.role = 'guest';
+  send(host, { t: 'matched', role: 'host', opp: guest.name, ranked, oppMmr: ranked ? guest.p.mmr : 0 });
+  send(guest, { t: 'matched', role: 'guest', opp: host.name, ranked, oppMmr: ranked ? host.p.mmr : 0 });
+}
+setInterval(() => {
+  const now = Date.now(); queue.sort((a, b) => a.since - b.since);
+  for (let i = 0; i < queue.length; i++) {
+    const a = queue[i];
+    for (let j = i + 1; j < queue.length; j++) {
+      const b = queue[j]; if (a.uid && a.uid === b.uid) continue;
+      const w = Math.min(WIN_BASE + WIN_GROW * (now - a.since) / 1000, WIN_BASE + WIN_GROW * (now - b.since) / 1000);
+      if (Math.abs(a.p.mmr - b.p.mmr) <= w) { pair(a, b, true); i = -1; break; }   // longest waiter hosts
+    }
+  }
+  for (const c of queue) send(c, { t: 'q', range: Math.round(WIN_BASE + WIN_GROW * (now - c.since) / 1000), n: queue.length });
+}, 1000);
+
+const HOST_ONLY = new Set(['start', 's', 'over']), GUEST_ONLY = new Set(['hello', 'in', 'joy']), EITHER = new Set(['rm', 'nonce']);
+
+wss.on('connection', (ws, req) => {
+  if (ORIGINS.length && !ORIGINS.some(o => String(req.headers.origin || '').endsWith(o))) { ws.close(1008, 'origin'); return; }
+  ws.isAlive = true; ws.on('pong', () => { ws.isAlive = true; });
+  const c = { id: nextId++, ws, uid: '', p: null, name: '', role: '', partner: null, match: null, room: null, since: 0, n: 0, t0: Date.now() };
+  ws.on('message', raw => {
+    const now = Date.now(); if (now - c.t0 >= 1000) { c.t0 = now; c.n = 0; } if (++c.n > MAX_MSG_PER_SEC) return;
+    let m; try { m = JSON.parse(raw); } catch (e) { return; }
+    if (!m || typeof m !== 'object') return;
+    if (m.name !== undefined) { c.name = clean(m.name, 16); if (c.p) c.p.name = c.name; }
+    switch (m.t) {
+      case 'auth': {
+        const uid = clean(m.uid, 64); if (uid.length < 8) return;
+        c.uid = uid; c.p = player(uid); if (c.name) c.p.name = c.name; dirty = true;
+        send(c, { t: 'me', ...pub(c.p), rank: c.p.g ? rankOf(c.p) : 0 }); break;
+      }
+      case 'find':
+        if (c.partner) return; if (!c.p) return send(c, { t: 'err', m: 'Sign-in failed, reconnect and try again.' });
+        leaveAll(c, false); c.since = Date.now(); queue.push(c); send(c, { t: 'queued', mmr: c.p.mmr }); break;
+      case 'create': {
+        if (c.partner) return; leaveAll(c, false);
+        const code = code4(); if (!code) return send(c, { t: 'err', m: 'Server is busy, try again.' });
+        c.room = code; rooms.set(code, c); send(c, { t: 'room', code }); break;
+      }
+      case 'join': {
+        if (c.partner) return; const code = clean(m.code, 4).toUpperCase(), h = rooms.get(code);
+        if (!h || h === c || h.partner) return send(c, { t: 'err', m: 'Room not found or already full.' });
+        pair(h, c, false); break;
+      }
+      case 'lb': {
+        const top = Object.values(DB).filter(q => q.g > 0).sort((a, b) => b.mmr - a.mmr).slice(0, 20).map(q => ({ n: q.name || 'Player', mmr: q.mmr, w: q.w, l: q.l, d: q.d }));
+        send(c, { t: 'lb', top, me: c.p ? { ...pub(c.p), rank: c.p.g ? rankOf(c.p) : 0 } : null }); break;
+      }
+      case 'ping': send(c, { t: 'pong', ts: num(m.ts, 0, 9e15, 0) }); break;
+      case 'cancel': leaveAll(c, true); break;
+      case 'r': {
+        const p = c.partner, d = m.d; if (!p || !d || typeof d.k !== 'string') return;
+        /* clients agree on who hosts (random-number handshake); the first 'hello' tells us who the guest is, after that roles are enforced */
+        if (d.k === 'hello' && c.match && !c.match.roles) { c.role = 'guest'; p.role = 'host'; c.match.roles = 1; }
+        if (d.k === 'nonce') { d.n = +d.n || 0; }
+        if (HOST_ONLY.has(d.k) ? c.role !== 'host' : GUEST_ONLY.has(d.k) ? c.role !== 'guest' : !EITHER.has(d.k)) return;
+        if (d.k === 'hello') { d.i = sanitizeInfo(d.i); if (!d.i) return; }
+        if (d.k === 'start') { d.h = sanitizeInfo(d.h); d.g = sanitizeInfo(d.g); if (!d.h || !d.g) return; if (c.match) { c.match.live = true; c.match.done = false; c.match.t0 = Date.now(); } }
+        if (d.k === 'in') { d.a = clean(d.a, 16); d.d = d.d ? 1 : 0; }
+        if (d.k === 'over' && c.match && c.match.ranked && c.match.live && !c.match.done) settleScore(c.match, d.sc, d.pw);
+        send(p, { t: 'r', d }); break;
+      }
+    }
+  });
+  ws.on('close', () => leaveAll(c, true));
+  ws.on('error', () => { });
+});
+setInterval(() => { wss.clients.forEach(ws => { if (ws.isAlive === false) return ws.terminate(); ws.isAlive = false; ws.ping(); }); }, 20000);
+
+server.listen(PORT, () => console.log('Pitch Fury server listening on :' + PORT));
