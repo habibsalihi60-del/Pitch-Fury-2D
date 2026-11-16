@@ -117,7 +117,7 @@ setInterval(() => {
   for (const c of queue) send(c, { t: 'q', range: Math.round(WIN_BASE + WIN_GROW * (now - c.since) / 1000), n: queue.length });
 }, 1000);
 
-const HOST_ONLY = new Set(['start', 's', 'over']), GUEST_ONLY = new Set(['hello', 'in', 'joy']), EITHER = new Set(['rm', 'nonce']);
+const HOST_ONLY = new Set(['start', 's', 'over']), GUEST_ONLY = new Set(['hello', 'in', 'joy']), EITHER = new Set(['rm', 'nonce', 'rtc']);
 
 wss.on('connection', (ws, req) => {
    wss.on('connection', (ws, req) => {
