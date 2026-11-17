@@ -120,9 +120,8 @@ setInterval(() => {
 const HOST_ONLY = new Set(['start', 's', 'over']), GUEST_ONLY = new Set(['hello', 'in', 'joy']), EITHER = new Set(['rm', 'nonce', 'rtc']);
 
 wss.on('connection', (ws, req) => {
-   wss.on('connection', (ws, req) => {
   req.socket.setNoDelay(true);   // send small packets immediately
-  ...
+  if (ORIGINS.length && !ORIGINS.some(o => String(req.headers.origin || '').endsWith(o))) { ws.close(1008, 'origin'); return; }
   if (ORIGINS.length && !ORIGINS.some(o => String(req.headers.origin || '').endsWith(o))) { ws.close(1008, 'origin'); return; }
   ws.isAlive = true; ws.on('pong', () => { ws.isAlive = true; });
   const c = { id: nextId++, ws, uid: '', p: null, name: '', role: '', partner: null, match: null, room: null, since: 0, n: 0, t0: Date.now() };
